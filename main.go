@@ -40,15 +40,22 @@ func main() {
 	builderChan := make(chan string)
 	go builder(builderChan)
 	randSrc := rand.New(rand.NewSource(time.Now().UnixNano()))
-	http.HandleFunc("/handle-push-event/multi-life-dev", func(w http.ResponseWriter, r *http.Request) {
-		handlePushEvent(r, "/multi-life-dev", secret, builderChan, randSrc)
+
+	path := "/multi-life-dev"
+	dependencies := []string{".vimrc", "Dockerfile", "plugins.vim"}
+	http.HandleFunc("/handle-push-event"+path, func(w http.ResponseWriter, r *http.Request) {
+		handlePushEvent(r, path, secret, dependencies, builderChan, randSrc)
 	})
-	http.HandleFunc("/handle-push-event/multi-life", func(w http.ResponseWriter, r *http.Request) {
+	path2 := "/multi-life"
+	dependencies2 := []string{"go.mod", "go.sum"}
+	http.HandleFunc("/handle-push-event"+path2, func(w http.ResponseWriter, r *http.Request) {
+		handlePushEvent(r, path2, secret, dependencies2, builderChan, randSrc)
 	})
 	log.Fatal(http.ListenAndServe(":8000", nil))
 }
 
-func handlePushEvent(r *http.Request, path string, secret string, builderChan chan string, randSrc *rand.Rand) {
+func handlePushEvent(r *http.Request, path string, secret string, dep []string,
+	builderChan chan string, randSrc *rand.Rand) {
 	macStr := r.Header.Get("X-Hub-Signature-256")
 	if macStr == "" {
 		log.Printf("Request at %v is missing a MAC.\n", path)
@@ -86,17 +93,17 @@ func handlePushEvent(r *http.Request, path string, secret string, builderChan ch
 	repo := path[1:]
 	for _, com := range p.Commits {
 		for _, file := range com.Added {
-			if buildIfDependent(file, repo, p.After, builderChan, randSrc) {
+			if buildIfDependent(dep, file, repo, p.After, builderChan, randSrc) {
 				return
 			}
 		}
 		for _, file := range com.Removed {
-			if buildIfDependent(file, repo, p.After, builderChan, randSrc) {
+			if buildIfDependent(dep, file, repo, p.After, builderChan, randSrc) {
 				return
 			}
 		}
 		for _, file := range com.Modified {
-			if buildIfDependent(file, repo, p.After, builderChan, randSrc) {
+			if buildIfDependent(dep, file, repo, p.After, builderChan, randSrc) {
 				return
 			}
 		}
@@ -120,18 +127,21 @@ func readBody(r *http.Request) ([]byte, error) {
 
 // buildIfDependent starts a build if the given file is a build dependency.
 // It returns a bool indicating whether a build was started.
-func buildIfDependent(file string, repo string, commitID string, builderChan chan string, r *rand.Rand) bool {
-	if file == ".vimrc" || file == "Dockerfile" || file == "plugins.vim" {
-		buildID := generateBuildID(r)
-		log.Printf("Build triggered...\n"+
-			"File changed: %v\n"+
-			"Repository: %v\n"+
-			"HEAD at time of build: %v\n"+
-			"Build ID: %v\n"+
-			"See %v for output.\n",
-			file, repo, commitID, buildID, builderLogPath)
-		builderChan <- buildID
-		return true
+func buildIfDependent(dep []string, file string, repo string, commitID string,
+	builderChan chan string, r *rand.Rand) bool {
+	for _, d := range dep {
+		if file == d {
+			buildID := generateBuildID(r)
+			log.Printf("Build triggered...\n"+
+				"File changed: %v\n"+
+				"Repository: %v\n"+
+				"HEAD at time of build: %v\n"+
+				"Build ID: %v\n"+
+				"See %v for output.\n",
+				file, repo, commitID, buildID, builderLogPath)
+			builderChan <- buildID
+			return true
+		}
 	}
 	return false
 }
@@ -146,10 +156,10 @@ func generateBuildID(r *rand.Rand) string {
 // (string) messages sent on a channel. builder will always build from the
 // latest multi-life-dev code, regardless of the commit that triggered the
 // build.
-
+//
 // If a build ID comes in while a build is in progress, the build is canceled
 // and a new one is started.
-
+//
 // builder logs to a separate file specified by the builderLogPath variable.
 // This is done so that when builder runs on a separate goroutine its output is
 // easily distinguishable from the output of the main goroutine. This would be
