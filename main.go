@@ -9,10 +9,162 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/smtp"
 	"os"
 	"os/exec"
 	"time"
 )
+
+const (
+	mainLogPath    = "./main.log"
+	builderLogPath = "./builder.log"
+)
+
+func main() {
+	logFile := openLogFile(mainLogPath)
+	defer logFile.Close()
+	log.SetOutput(logFile)
+	secret := lookupEnvOrExit("WEBHOOK_SECRET")
+	m := newMailer()
+	builderChan := make(chan string)
+	go builder(builderChan, m)
+	randSrc := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	path := "/multi-life-dev"
+	dependencies := []string{".vimrc", "Dockerfile", "plugins.vim"}
+	http.HandleFunc("/handle-push-event"+path, func(w http.ResponseWriter, r *http.Request) {
+		handlePushEvent(r, path, secret, dependencies, builderChan, randSrc, m)
+	})
+	path2 := "/multi-life"
+	dependencies2 := []string{"go.mod", "go.sum"}
+	http.HandleFunc("/handle-push-event"+path2, func(w http.ResponseWriter, r *http.Request) {
+		handlePushEvent(r, path2, secret, dependencies2, builderChan, randSrc, m)
+	})
+	log.Fatal(http.ListenAndServe(":8000", nil))
+}
+
+// openLogFile opens the given file for appending, creating it if it doesn't
+// exist.
+func openLogFile(path string) *os.File {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
+	if err != nil {
+		panic(err)
+	}
+	return file
+}
+
+func lookupEnvOrExit(key string) string {
+	value, ok := os.LookupEnv(key)
+	if !ok {
+		log.Fatal(key + " not set.")
+	}
+	return value
+}
+
+// mailer is just the collection of args to pass to smtp.SendMail.
+type mailer struct {
+	addr string
+	auth smtp.Auth
+	from string
+	to   []string
+}
+
+func newMailer() *mailer {
+	username := "code.alexn@gmail.com"
+	secret := lookupEnvOrExit("EMAIL_AUTH_SECRET")
+	host := "smtp.elasticemail.com"
+	auth := smtp.PlainAuth("", username, secret, host)
+	return &mailer{
+		addr: host + ":2525",
+		auth: auth,
+		from: username,
+		to:   []string{"alex.nicoll@outlook.com"},
+	}
+}
+
+func sendBuildFailure(m *mailer, buildID string) {
+	body := []byte("Subject: multi-life-dev-builder: build failed\r\n" +
+		"\r\n" +
+		"Build ID: " + buildID + ". See .log files for details.\r\n")
+	err := smtp.SendMail(m.addr, m.auth, m.from, m.to, body)
+	if err != nil {
+		log.Fatal("Failed to send email.")
+	}
+}
+
+func handlePushEvent(r *http.Request, path string, secret string, dep []string,
+	builderChan chan string, randSrc *rand.Rand, m *mailer) {
+
+	buildID := generateBuildID(randSrc)
+	log.Printf("Handling request. Build ID: %v\n", buildID)
+
+	macStr := r.Header.Get("X-Hub-Signature-256")
+	if macStr == "" {
+		log.Printf("Request at %v is missing a MAC.\n", path)
+		sendBuildFailure(m, buildID)
+		return
+	}
+	// macStr should contain a hex string prepended with "sha256=".
+	// Remove the "sha256=" and decode the hex string to bytes.
+	mac, err := hex.DecodeString(macStr[7:])
+	if err != nil {
+		log.Printf("Request at %v contains a malformed MAC.\n%v\n", path, err)
+		sendBuildFailure(m, buildID)
+		return
+	}
+	hashFn := hmac.New(sha256.New, []byte(secret))
+	body, err := readBody(r)
+	if err != nil {
+		log.Println(err)
+		sendBuildFailure(m, buildID)
+		return
+	}
+	_, err = hashFn.Write(body)
+	if err != nil {
+		log.Println(err)
+		sendBuildFailure(m, buildID)
+		return
+	}
+	expectedMac := hashFn.Sum(nil)
+	if !hmac.Equal(mac, expectedMac) {
+		log.Printf("Request at %v contains an unexpected MAC.\n"+
+			"Expected %x\nGot %x\n", path, expectedMac, mac)
+		sendBuildFailure(m, buildID)
+		return
+	}
+	p := &payload{}
+	err = json.Unmarshal(body, p)
+	if err != nil {
+		log.Println(err)
+		sendBuildFailure(m, buildID)
+		return
+	}
+	// Remove the leading slash to get the repository name.
+	repo := path[1:]
+	for _, com := range p.Commits {
+		for _, file := range com.Added {
+			if buildIfDependent(dep, file, repo, p.After, builderChan, buildID) {
+				return
+			}
+		}
+		for _, file := range com.Removed {
+			if buildIfDependent(dep, file, repo, p.After, builderChan, buildID) {
+				return
+			}
+		}
+		for _, file := range com.Modified {
+			if buildIfDependent(dep, file, repo, p.After, builderChan, buildID) {
+				return
+			}
+		}
+	}
+}
+
+func generateBuildID(r *rand.Rand) string {
+	b := make([]byte, 4)
+	r.Read(b)
+	return hex.EncodeToString(b)
+}
 
 // When unmarshaling JSON to a struct via json.Unmarshal, object keys which
 // don't have a corresponding struct field are ignored. So we define a struct
@@ -27,87 +179,6 @@ type commit struct {
 	Added    []string
 	Removed  []string
 	Modified []string
-}
-
-const builderLogPath = "./builder.log"
-
-func main() {
-	key := "WEBHOOK_SECRET"
-	secret, ok := os.LookupEnv(key)
-	if !ok {
-		log.Fatal(key + " not set.")
-	}
-	builderChan := make(chan string)
-	go builder(builderChan)
-	randSrc := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	path := "/multi-life-dev"
-	dependencies := []string{".vimrc", "Dockerfile", "plugins.vim"}
-	http.HandleFunc("/handle-push-event"+path, func(w http.ResponseWriter, r *http.Request) {
-		handlePushEvent(r, path, secret, dependencies, builderChan, randSrc)
-	})
-	path2 := "/multi-life"
-	dependencies2 := []string{"go.mod", "go.sum"}
-	http.HandleFunc("/handle-push-event"+path2, func(w http.ResponseWriter, r *http.Request) {
-		handlePushEvent(r, path2, secret, dependencies2, builderChan, randSrc)
-	})
-	log.Fatal(http.ListenAndServe(":8000", nil))
-}
-
-func handlePushEvent(r *http.Request, path string, secret string, dep []string,
-	builderChan chan string, randSrc *rand.Rand) {
-	macStr := r.Header.Get("X-Hub-Signature-256")
-	if macStr == "" {
-		log.Printf("Request at %v is missing a MAC.\n", path)
-		return
-	}
-	// macStr should contain a hex string prepended with "sha256=".
-	// Remove the "sha256=" and decode the hex string to bytes.
-	mac, err := hex.DecodeString(macStr[7:])
-	if err != nil {
-		log.Printf("Request at %v contains a malformed MAC.\n%v\n", path, err)
-		return
-	}
-	hashFn := hmac.New(sha256.New, []byte(secret))
-	body, err := readBody(r)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	_, err = hashFn.Write(body)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-	expectedMac := hashFn.Sum(nil)
-	if !hmac.Equal(mac, expectedMac) {
-		log.Printf("Request at %v contains an unexpected MAC.\n"+
-			"Expected %x\nGot %x\n", path, expectedMac, mac)
-	}
-	p := &payload{}
-	err = json.Unmarshal(body, p)
-	if err != nil {
-		log.Println(err)
-	}
-	// Remove the leading slash to get the repository name.
-	repo := path[1:]
-	for _, com := range p.Commits {
-		for _, file := range com.Added {
-			if buildIfDependent(dep, file, repo, p.After, builderChan, randSrc) {
-				return
-			}
-		}
-		for _, file := range com.Removed {
-			if buildIfDependent(dep, file, repo, p.After, builderChan, randSrc) {
-				return
-			}
-		}
-		for _, file := range com.Modified {
-			if buildIfDependent(dep, file, repo, p.After, builderChan, randSrc) {
-				return
-			}
-		}
-	}
 }
 
 func readBody(r *http.Request) ([]byte, error) {
@@ -128,28 +199,20 @@ func readBody(r *http.Request) ([]byte, error) {
 // buildIfDependent starts a build if the given file is a build dependency.
 // It returns a bool indicating whether a build was started.
 func buildIfDependent(dep []string, file string, repo string, commitID string,
-	builderChan chan string, r *rand.Rand) bool {
+	builderChan chan string, buildID string) bool {
 	for _, d := range dep {
 		if file == d {
-			buildID := generateBuildID(r)
 			log.Printf("Build triggered...\n"+
 				"File changed: %v\n"+
 				"Repository: %v\n"+
 				"HEAD at time of build: %v\n"+
-				"Build ID: %v\n"+
 				"See %v for output.\n",
-				file, repo, commitID, buildID, builderLogPath)
+				file, repo, commitID, builderLogPath)
 			builderChan <- buildID
 			return true
 		}
 	}
 	return false
-}
-
-func generateBuildID(r *rand.Rand) string {
-	b := make([]byte, 4)
-	r.Read(b)
-	return hex.EncodeToString(b)
 }
 
 // builder builds and pushes the multi-life-dev image in response to build ID
@@ -165,13 +228,8 @@ func generateBuildID(r *rand.Rand) string {
 // easily distinguishable from the output of the main goroutine. This would be
 // difficult to achieve with log tags because much of builder's output comes
 // from external commands, which do not use Go's logging mechanism.
-func builder(builderChan chan string) {
-	// Open the log file, creating it if it doesn't exist.
-	logFile, err := os.OpenFile(builderLogPath,
-		os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0666)
-	if err != nil {
-		panic(err)
-	}
+func builder(builderChan chan string, m *mailer) {
+	logFile := openLogFile(builderLogPath)
 	defer logFile.Close()
 	// Create a logger pointing to the log file.
 	logger := log.New(logFile, "", log.LstdFlags)
@@ -189,11 +247,11 @@ func builder(builderChan chan string) {
 		cmd := exec.Command("docker", "build", "--no-cache", "-t",
 			"alexnicoll/multi-life-dev",
 			"https://github.com/alex-nicoll/multi-life-dev.git#main")
-		if !run(cmd, builderChan, logFile, logger, &buildID) {
+		if !run(cmd, builderChan, logFile, logger, &buildID, m) {
 			continue
 		}
 		cmd = exec.Command("docker", "push", "alexnicoll/multi-life-dev")
-		if !run(cmd, builderChan, logFile, logger, &buildID) {
+		if !run(cmd, builderChan, logFile, logger, &buildID, m) {
 			continue
 		}
 		buildID = ""
@@ -201,13 +259,14 @@ func builder(builderChan chan string) {
 }
 
 func run(cmd *exec.Cmd, builderChan chan string, logFile *os.File,
-	logger *log.Logger, buildID *string) bool {
+	logger *log.Logger, buildID *string, m *mailer) bool {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	logger.Printf("Running command %v\n", cmd)
 	if err := cmd.Start(); err != nil {
 		logger.Printf("An error occurred while starting the command: %v\n",
 			err)
+		sendBuildFailure(m, *buildID)
 		*buildID = ""
 		return false
 	}
@@ -221,6 +280,7 @@ func run(cmd *exec.Cmd, builderChan chan string, logFile *os.File,
 		if err != nil {
 			logger.Printf("An error occurred while running the command: %v\n",
 				err)
+			sendBuildFailure(m, *buildID)
 			*buildID = ""
 			return false
 		}
@@ -238,6 +298,8 @@ func run(cmd *exec.Cmd, builderChan chan string, logFile *os.File,
 			logger.Printf("An error occurred while running the command: %v\n",
 				err)
 		}
+		// Don't send a build failure email in this case. A canceled build
+		// isn't considered a failure.
 		return false
 	}
 }
