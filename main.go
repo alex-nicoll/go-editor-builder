@@ -30,15 +30,68 @@ func main() {
 	go builder(builderChan, m)
 	randSrc := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	path := "/multi-life-dev"
-	dependencies := []string{".vimrc", "Dockerfile", "plugins.vim"}
-	http.HandleFunc("/handle-push-event"+path, func(w http.ResponseWriter, r *http.Request) {
-		handlePushEvent(r, path, secret, dependencies, builderChan, randSrc, m)
-	})
-	path2 := "/multi-life"
-	dependencies2 := []string{"go.mod", "go.sum"}
-	http.HandleFunc("/handle-push-event"+path2, func(w http.ResponseWriter, r *http.Request) {
-		handlePushEvent(r, path2, secret, dependencies2, builderChan, randSrc, m)
+	http.HandleFunc("/handle-push-event/multi-life-dev", func(w http.ResponseWriter, r *http.Request) {
+		buildID := generateBuildID(randSrc)
+		log.Printf("Handling request. Build ID: %v\n", buildID)
+
+		macStr := r.Header.Get("X-Hub-Signature-256")
+		if macStr == "" {
+			log.Println("Request is missing a MAC.")
+			sendBuildFailure(m, buildID)
+			return
+		}
+		// macStr should contain a hex string prepended with "sha256=".
+		// Remove the "sha256=" and decode the hex string to bytes.
+		mac, err := hex.DecodeString(macStr[7:])
+		if err != nil {
+			log.Printf("Request contains a malformed MAC.\n%v\n", err)
+			sendBuildFailure(m, buildID)
+			return
+		}
+		hashFn := hmac.New(sha256.New, []byte(secret))
+		body, err := readBody(r)
+		if err != nil {
+			log.Println(err)
+			sendBuildFailure(m, buildID)
+			return
+		}
+		_, err = hashFn.Write(body)
+		if err != nil {
+			log.Println(err)
+			sendBuildFailure(m, buildID)
+			return
+		}
+		expectedMac := hashFn.Sum(nil)
+		if !hmac.Equal(mac, expectedMac) {
+			log.Printf("Request contains an unexpected MAC.\n"+
+				"Expected %x\nGot %x\n", expectedMac, mac)
+			sendBuildFailure(m, buildID)
+			return
+		}
+		p := &payload{}
+		err = json.Unmarshal(body, p)
+		if err != nil {
+			log.Println(err)
+			sendBuildFailure(m, buildID)
+			return
+		}
+		for _, com := range p.Commits {
+			for _, file := range com.Added {
+				if buildIfDependent(file, p.After, builderChan, buildID) {
+					return
+				}
+			}
+			for _, file := range com.Removed {
+				if buildIfDependent(file, p.After, builderChan, buildID) {
+					return
+				}
+			}
+			for _, file := range com.Modified {
+				if buildIfDependent(file, p.After, builderChan, buildID) {
+					return
+				}
+			}
+		}
 	})
 	log.Fatal(http.ListenAndServe(":8000", nil))
 }
@@ -92,74 +145,6 @@ func sendBuildFailure(m *mailer, buildID string) {
 	}
 }
 
-func handlePushEvent(r *http.Request, path string, secret string, dep []string,
-	builderChan chan string, randSrc *rand.Rand, m *mailer) {
-
-	buildID := generateBuildID(randSrc)
-	log.Printf("Handling request. Build ID: %v\n", buildID)
-
-	macStr := r.Header.Get("X-Hub-Signature-256")
-	if macStr == "" {
-		log.Printf("Request at %v is missing a MAC.\n", path)
-		sendBuildFailure(m, buildID)
-		return
-	}
-	// macStr should contain a hex string prepended with "sha256=".
-	// Remove the "sha256=" and decode the hex string to bytes.
-	mac, err := hex.DecodeString(macStr[7:])
-	if err != nil {
-		log.Printf("Request at %v contains a malformed MAC.\n%v\n", path, err)
-		sendBuildFailure(m, buildID)
-		return
-	}
-	hashFn := hmac.New(sha256.New, []byte(secret))
-	body, err := readBody(r)
-	if err != nil {
-		log.Println(err)
-		sendBuildFailure(m, buildID)
-		return
-	}
-	_, err = hashFn.Write(body)
-	if err != nil {
-		log.Println(err)
-		sendBuildFailure(m, buildID)
-		return
-	}
-	expectedMac := hashFn.Sum(nil)
-	if !hmac.Equal(mac, expectedMac) {
-		log.Printf("Request at %v contains an unexpected MAC.\n"+
-			"Expected %x\nGot %x\n", path, expectedMac, mac)
-		sendBuildFailure(m, buildID)
-		return
-	}
-	p := &payload{}
-	err = json.Unmarshal(body, p)
-	if err != nil {
-		log.Println(err)
-		sendBuildFailure(m, buildID)
-		return
-	}
-	// Remove the leading slash to get the repository name.
-	repo := path[1:]
-	for _, com := range p.Commits {
-		for _, file := range com.Added {
-			if buildIfDependent(dep, file, repo, p.After, builderChan, buildID) {
-				return
-			}
-		}
-		for _, file := range com.Removed {
-			if buildIfDependent(dep, file, repo, p.After, builderChan, buildID) {
-				return
-			}
-		}
-		for _, file := range com.Modified {
-			if buildIfDependent(dep, file, repo, p.After, builderChan, buildID) {
-				return
-			}
-		}
-	}
-}
-
 func generateBuildID(r *rand.Rand) string {
 	b := make([]byte, 4)
 	r.Read(b)
@@ -198,19 +183,16 @@ func readBody(r *http.Request) ([]byte, error) {
 
 // buildIfDependent starts a build if the given file is a build dependency.
 // It returns a bool indicating whether a build was started.
-func buildIfDependent(dep []string, file string, repo string, commitID string,
-	builderChan chan string, buildID string) bool {
-	for _, d := range dep {
-		if file == d {
-			log.Printf("Build triggered...\n"+
-				"File changed: %v\n"+
-				"Repository: %v\n"+
-				"HEAD at time of build: %v\n"+
-				"See %v for output.\n",
-				file, repo, commitID, builderLogPath)
-			builderChan <- buildID
-			return true
-		}
+func buildIfDependent(file string, commitID string, builderChan chan string,
+	buildID string) bool {
+	if file == ".vimrc" || file == "Dockerfile" || file == "plugins.vim" {
+		log.Printf("Build triggered...\n"+
+			"File changed: %v\n"+
+			"HEAD at time of build: %v\n"+
+			"See %v for output.\n",
+			file, commitID, builderLogPath)
+		builderChan <- buildID
+		return true
 	}
 	return false
 }
@@ -255,6 +237,7 @@ func builder(builderChan chan string, m *mailer) {
 			continue
 		}
 		buildID = ""
+		logger.Println("Build complete.")
 	}
 }
 
