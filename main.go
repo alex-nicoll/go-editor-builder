@@ -31,13 +31,17 @@ func main() {
 	randSrc := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	http.HandleFunc("/handle-push-event/multi-life-dev", func(w http.ResponseWriter, r *http.Request) {
-		requestID := generateRequestID(randSrc)
-		log.Printf("Handling request. Request ID: %v\n", requestID)
-
+		deliveryID := r.Header.Get("X-GitHub-Delivery")
+		log.Printf("Handling request. Delivery ID: %v\n", deliveryID)
+		if deliveryID == "" {
+			log.Println("Request is missing a delivery ID.")
+			sendEmail(m, newRqstProcFailureMsg("none"))
+			return
+		}
 		macStr := r.Header.Get("X-Hub-Signature-256")
 		if macStr == "" {
 			log.Println("Request is missing a MAC.")
-			sendEmail(m, newRqstProcFailureMsg(requestID))
+			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		// macStr should contain a hex string prepended with "sha256=".
@@ -45,34 +49,34 @@ func main() {
 		mac, err := hex.DecodeString(macStr[7:])
 		if err != nil {
 			log.Printf("Request contains a malformed MAC.\n%v\n", err)
-			sendEmail(m, newRqstProcFailureMsg(requestID))
+			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		hashFn := hmac.New(sha256.New, []byte(secret))
 		body, err := readBody(r)
 		if err != nil {
 			log.Println(err)
-			sendEmail(m, newRqstProcFailureMsg(requestID))
+			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		_, err = hashFn.Write(body)
 		if err != nil {
 			log.Println(err)
-			sendEmail(m, newRqstProcFailureMsg(requestID))
+			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		expectedMac := hashFn.Sum(nil)
 		if !hmac.Equal(mac, expectedMac) {
 			log.Printf("Request contains an unexpected MAC.\n"+
 				"Expected %x\nGot %x\n", expectedMac, mac)
-			sendEmail(m, newRqstProcFailureMsg(requestID))
+			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		p := &payload{}
 		err = json.Unmarshal(body, p)
 		if err != nil {
 			log.Println(err)
-			sendEmail(m, newRqstProcFailureMsg(requestID))
+			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		for _, com := range p.Commits {
@@ -142,10 +146,10 @@ func sendEmail(m *mailer, msg []byte) {
 	}
 }
 
-func newRqstProcFailureMsg(requestID string) []byte {
+func newRqstProcFailureMsg(deliveryID string) []byte {
 	return []byte("Subject: multi-life-dev-builder: error processing request\r\n" +
 		"\r\n" +
-		"Request ID: " + requestID + "\r\n" +
+		"Delivery ID: " + deliveryID + "\r\n" +
 		"See " + serverLogFileName + " for details.\r\n")
 }
 
@@ -154,12 +158,6 @@ func newBuildFailureMsg(commitID string) []byte {
 		"\r\n" +
 		"Commit ID: " + commitID + "\r\n" +
 		"See " + builderLogFileName + " for details.\r\n")
-}
-
-func generateRequestID(r *rand.Rand) string {
-	b := make([]byte, 4)
-	r.Read(b)
-	return hex.EncodeToString(b)
 }
 
 // When unmarshaling JSON to a struct via json.Unmarshal, object keys which
@@ -211,11 +209,11 @@ func buildIfDependent(file string, commitID string, builderChan chan string) boo
 // sent on builderChan. If a commit ID comes in while a build is in progress,
 // the build is canceled and a new one is started.
 //
-// builder logs to a separate file specified by the builderLogPath variable.
-// This is done so that when builder runs on a separate goroutine its output is
-// easily distinguishable from the output of the main goroutine. This would be
-// difficult to achieve with log tags because much of builder's output comes
-// from external commands, which do not use Go's logging mechanism.
+// builder logs to a separate file specified by the builderLogFileName
+// variable. This is done so that when builder runs on a separate goroutine its
+// output is easily distinguishable from the output of the main goroutine. This
+// would be difficult to achieve with log tags because much of builder's output
+// comes from external commands, which do not use Go's logging mechanism.
 func builder(builderChan chan string, m *mailer) {
 	logFile := openLogFile(builderLogFileName)
 	defer logFile.Close()
