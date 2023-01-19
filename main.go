@@ -16,12 +16,12 @@ import (
 )
 
 const (
-	mainLogPath    = "./main.log"
-	builderLogPath = "./builder.log"
+	serverLogFileName  = "server.log"
+	builderLogFileName = "builder.log"
 )
 
 func main() {
-	logFile := openLogFile(mainLogPath)
+	logFile := openLogFile(serverLogFileName)
 	defer logFile.Close()
 	log.SetOutput(logFile)
 	secret := lookupEnvOrExit("WEBHOOK_SECRET")
@@ -31,13 +31,13 @@ func main() {
 	randSrc := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	http.HandleFunc("/handle-push-event/multi-life-dev", func(w http.ResponseWriter, r *http.Request) {
-		buildID := generateBuildID(randSrc)
-		log.Printf("Handling request. Build ID: %v\n", buildID)
+		requestID := generateRequestID(randSrc)
+		log.Printf("Handling request. Request ID: %v\n", requestID)
 
 		macStr := r.Header.Get("X-Hub-Signature-256")
 		if macStr == "" {
 			log.Println("Request is missing a MAC.")
-			sendBuildFailure(m, buildID)
+			sendEmail(m, newRqstProcFailureMsg(requestID))
 			return
 		}
 		// macStr should contain a hex string prepended with "sha256=".
@@ -45,49 +45,49 @@ func main() {
 		mac, err := hex.DecodeString(macStr[7:])
 		if err != nil {
 			log.Printf("Request contains a malformed MAC.\n%v\n", err)
-			sendBuildFailure(m, buildID)
+			sendEmail(m, newRqstProcFailureMsg(requestID))
 			return
 		}
 		hashFn := hmac.New(sha256.New, []byte(secret))
 		body, err := readBody(r)
 		if err != nil {
 			log.Println(err)
-			sendBuildFailure(m, buildID)
+			sendEmail(m, newRqstProcFailureMsg(requestID))
 			return
 		}
 		_, err = hashFn.Write(body)
 		if err != nil {
 			log.Println(err)
-			sendBuildFailure(m, buildID)
+			sendEmail(m, newRqstProcFailureMsg(requestID))
 			return
 		}
 		expectedMac := hashFn.Sum(nil)
 		if !hmac.Equal(mac, expectedMac) {
 			log.Printf("Request contains an unexpected MAC.\n"+
 				"Expected %x\nGot %x\n", expectedMac, mac)
-			sendBuildFailure(m, buildID)
+			sendEmail(m, newRqstProcFailureMsg(requestID))
 			return
 		}
 		p := &payload{}
 		err = json.Unmarshal(body, p)
 		if err != nil {
 			log.Println(err)
-			sendBuildFailure(m, buildID)
+			sendEmail(m, newRqstProcFailureMsg(requestID))
 			return
 		}
 		for _, com := range p.Commits {
 			for _, file := range com.Added {
-				if buildIfDependent(file, p.After, builderChan, buildID) {
+				if buildIfDependent(file, p.After, builderChan) {
 					return
 				}
 			}
 			for _, file := range com.Removed {
-				if buildIfDependent(file, p.After, builderChan, buildID) {
+				if buildIfDependent(file, p.After, builderChan) {
 					return
 				}
 			}
 			for _, file := range com.Modified {
-				if buildIfDependent(file, p.After, builderChan, buildID) {
+				if buildIfDependent(file, p.After, builderChan) {
 					return
 				}
 			}
@@ -135,17 +135,28 @@ func newMailer() *mailer {
 	}
 }
 
-func sendBuildFailure(m *mailer, buildID string) {
-	body := []byte("Subject: multi-life-dev-builder: build failed\r\n" +
-		"\r\n" +
-		"Build ID: " + buildID + ". See .log files for details.\r\n")
-	err := smtp.SendMail(m.addr, m.auth, m.from, m.to, body)
+func sendEmail(m *mailer, msg []byte) {
+	err := smtp.SendMail(m.addr, m.auth, m.from, m.to, msg)
 	if err != nil {
 		log.Fatal("Failed to send email.")
 	}
 }
 
-func generateBuildID(r *rand.Rand) string {
+func newRqstProcFailureMsg(requestID string) []byte {
+	return []byte("Subject: multi-life-dev-builder: error processing request\r\n" +
+		"\r\n" +
+		"Request ID: " + requestID + "\r\n" +
+		"See " + serverLogFileName + " for details.\r\n")
+}
+
+func newBuildFailureMsg(commitID string) []byte {
+	return []byte("Subject: multi-life-dev-builder: build failure\r\n" +
+		"\r\n" +
+		"Commit ID: " + commitID + "\r\n" +
+		"See " + builderLogFileName + " for details.\r\n")
+}
+
+func generateRequestID(r *rand.Rand) string {
 	b := make([]byte, 4)
 	r.Read(b)
 	return hex.EncodeToString(b)
@@ -183,27 +194,22 @@ func readBody(r *http.Request) ([]byte, error) {
 
 // buildIfDependent starts a build if the given file is a build dependency.
 // It returns a bool indicating whether a build was started.
-func buildIfDependent(file string, commitID string, builderChan chan string,
-	buildID string) bool {
+func buildIfDependent(file string, commitID string, builderChan chan string) bool {
 	if file == ".vimrc" || file == "Dockerfile" || file == "plugins.vim" {
 		log.Printf("Build triggered...\n"+
 			"File changed: %v\n"+
-			"HEAD at time of build: %v\n"+
+			"Commit ID: %v\n"+
 			"See %v for output.\n",
-			file, commitID, builderLogPath)
-		builderChan <- buildID
+			file, commitID, builderLogFileName)
+		builderChan <- commitID
 		return true
 	}
 	return false
 }
 
-// builder builds and pushes the multi-life-dev image in response to build ID
-// (string) messages sent on a channel. builder will always build from the
-// latest multi-life-dev code, regardless of the commit that triggered the
-// build.
-//
-// If a build ID comes in while a build is in progress, the build is canceled
-// and a new one is started.
+// builder builds and pushes the multi-life-dev image in response to commit IDs
+// sent on builderChan. If a commit ID comes in while a build is in progress,
+// the build is canceled and a new one is started.
 //
 // builder logs to a separate file specified by the builderLogPath variable.
 // This is done so that when builder runs on a separate goroutine its output is
@@ -211,46 +217,46 @@ func buildIfDependent(file string, commitID string, builderChan chan string,
 // difficult to achieve with log tags because much of builder's output comes
 // from external commands, which do not use Go's logging mechanism.
 func builder(builderChan chan string, m *mailer) {
-	logFile := openLogFile(builderLogPath)
+	logFile := openLogFile(builderLogFileName)
 	defer logFile.Close()
 	// Create a logger pointing to the log file.
 	logger := log.New(logFile, "", log.LstdFlags)
-	// variable buildID stores the build ID message that interrupted the
-	// previous build, if any.
-	var buildID string
+	// variable commitID stores the commit ID that interrupted the previous
+	// build, if any.
+	var commitID string
 	for {
-		if buildID == "" {
+		if commitID == "" {
 			// The previous build completed (was not interrupted).
-			// Wait for a build ID.
-			buildID = <-builderChan
+			// Wait for a commit ID.
+			commitID = <-builderChan
 		}
-		logger.Printf("Starting build. Build ID: %v\n", buildID)
+		logger.Printf("Starting build. Commit ID: %v\n", commitID)
 
 		cmd := exec.Command("docker", "build", "--no-cache", "-t",
 			"alexnicoll/multi-life-dev",
-			"https://github.com/alex-nicoll/multi-life-dev.git#main")
-		if !run(cmd, builderChan, logFile, logger, &buildID, m) {
+			"https://github.com/alex-nicoll/multi-life-dev.git#"+commitID)
+		if !run(cmd, builderChan, logFile, logger, &commitID, m) {
 			continue
 		}
 		cmd = exec.Command("docker", "push", "alexnicoll/multi-life-dev")
-		if !run(cmd, builderChan, logFile, logger, &buildID, m) {
+		if !run(cmd, builderChan, logFile, logger, &commitID, m) {
 			continue
 		}
-		buildID = ""
+		commitID = ""
 		logger.Println("Build complete.")
 	}
 }
 
 func run(cmd *exec.Cmd, builderChan chan string, logFile *os.File,
-	logger *log.Logger, buildID *string, m *mailer) bool {
+	logger *log.Logger, commitID *string, m *mailer) bool {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	logger.Printf("Running command %v\n", cmd)
 	if err := cmd.Start(); err != nil {
 		logger.Printf("An error occurred while starting the command: %v\n",
 			err)
-		sendBuildFailure(m, *buildID)
-		*buildID = ""
+		sendEmail(m, newBuildFailureMsg(*commitID))
+		*commitID = ""
 		return false
 	}
 	// Wait for either the command to exit or for a message to arrive.
@@ -263,12 +269,12 @@ func run(cmd *exec.Cmd, builderChan chan string, logFile *os.File,
 		if err != nil {
 			logger.Printf("An error occurred while running the command: %v\n",
 				err)
-			sendBuildFailure(m, *buildID)
-			*buildID = ""
+			sendEmail(m, newBuildFailureMsg(*commitID))
+			*commitID = ""
 			return false
 		}
 		return true
-	case *buildID = <-builderChan:
+	case *commitID = <-builderChan:
 		// Another build has been requested.
 		logger.Println("Canceling build...")
 		// Assume that it is safe to call cmd.Process.Signal()
