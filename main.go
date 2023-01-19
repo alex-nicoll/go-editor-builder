@@ -7,12 +7,10 @@ import (
 	"encoding/json"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"net/smtp"
 	"os"
 	"os/exec"
-	"time"
 )
 
 const (
@@ -28,19 +26,19 @@ func main() {
 	m := newMailer()
 	builderChan := make(chan string)
 	go builder(builderChan, m)
-	randSrc := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	http.HandleFunc("/handle-push-event/multi-life-dev", func(w http.ResponseWriter, r *http.Request) {
 		deliveryID := r.Header.Get("X-GitHub-Delivery")
-		log.Printf("Handling request. Delivery ID: %v\n", deliveryID)
 		if deliveryID == "" {
 			log.Println("Request is missing a delivery ID.")
 			sendEmail(m, newRqstProcFailureMsg("none"))
 			return
 		}
+		log.Printf("(Delivery ID: %v) Handling request.\n", deliveryID)
 		macStr := r.Header.Get("X-Hub-Signature-256")
 		if macStr == "" {
-			log.Println("Request is missing a MAC.")
+			log.Printf("(Delivery ID: %v) Request is missing a MAC.\n",
+				deliveryID)
 			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
@@ -48,50 +46,51 @@ func main() {
 		// Remove the "sha256=" and decode the hex string to bytes.
 		mac, err := hex.DecodeString(macStr[7:])
 		if err != nil {
-			log.Printf("Request contains a malformed MAC.\n%v\n", err)
+			log.Printf("(Delivery ID: %v) Request contains a malformed "+
+				"MAC.\n%v\n", deliveryID, err)
 			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		hashFn := hmac.New(sha256.New, []byte(secret))
 		body, err := readBody(r)
 		if err != nil {
-			log.Println(err)
+			log.Printf("(Delivery ID: %v) %v\n", deliveryID, err)
 			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		_, err = hashFn.Write(body)
 		if err != nil {
-			log.Println(err)
+			log.Printf("(Delivery ID: %v) %v\n", deliveryID, err)
 			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		expectedMac := hashFn.Sum(nil)
 		if !hmac.Equal(mac, expectedMac) {
-			log.Printf("Request contains an unexpected MAC.\n"+
-				"Expected %x\nGot %x\n", expectedMac, mac)
+			log.Printf("(Delivery ID: %v) Request contains an unexpected "+
+				"MAC.\nExpected %x\nGot %x\n", deliveryID, expectedMac, mac)
 			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		p := &payload{}
 		err = json.Unmarshal(body, p)
 		if err != nil {
-			log.Println(err)
+			log.Printf("(Delivery ID: %v) %v\n", deliveryID, err)
 			sendEmail(m, newRqstProcFailureMsg(deliveryID))
 			return
 		}
 		for _, com := range p.Commits {
 			for _, file := range com.Added {
-				if buildIfDependent(file, p.After, builderChan) {
+				if buildIfDependent(deliveryID, file, p.After, builderChan) {
 					return
 				}
 			}
 			for _, file := range com.Removed {
-				if buildIfDependent(file, p.After, builderChan) {
+				if buildIfDependent(deliveryID, file, p.After, builderChan) {
 					return
 				}
 			}
 			for _, file := range com.Modified {
-				if buildIfDependent(file, p.After, builderChan) {
+				if buildIfDependent(deliveryID, file, p.After, builderChan) {
 					return
 				}
 			}
@@ -192,13 +191,14 @@ func readBody(r *http.Request) ([]byte, error) {
 
 // buildIfDependent starts a build if the given file is a build dependency.
 // It returns a bool indicating whether a build was started.
-func buildIfDependent(file string, commitID string, builderChan chan string) bool {
+func buildIfDependent(deliveryID string, file string, commitID string,
+	builderChan chan string) bool {
 	if file == ".vimrc" || file == "Dockerfile" || file == "plugins.vim" {
-		log.Printf("Build triggered...\n"+
-			"File changed: %v\n"+
-			"Commit ID: %v\n"+
+		log.Printf("(Delivery ID: %v) Build triggered...\n"+
+			"File changed by git push: %v\n"+
+			"Commit ID to build from: %v\n"+
 			"See %v for output.\n",
-			file, commitID, builderLogFileName)
+			deliveryID, file, commitID, builderLogFileName)
 		builderChan <- commitID
 		return true
 	}
@@ -206,14 +206,13 @@ func buildIfDependent(file string, commitID string, builderChan chan string) boo
 }
 
 // builder builds and pushes the multi-life-dev image in response to commit IDs
-// sent on builderChan. If a commit ID comes in while a build is in progress,
-// the build is canceled and a new one is started.
+// sent on builderChan. It should be run in a separate goroutine. If a commit
+// ID comes in while a build is in progress, the build is canceled and a new
+// one is started.
 //
 // builder logs to a separate file specified by the builderLogFileName
-// variable. This is done so that when builder runs on a separate goroutine its
-// output is easily distinguishable from the output of the main goroutine. This
-// would be difficult to achieve with log tags because much of builder's output
-// comes from external commands, which do not use Go's logging mechanism.
+// variable. Doing so ensures that its output is easily distinguishable from
+// the output of the goroutines that run the HTTP handler.
 func builder(builderChan chan string, m *mailer) {
 	logFile := openLogFile(builderLogFileName)
 	defer logFile.Close()
