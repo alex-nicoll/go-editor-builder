@@ -193,7 +193,7 @@ func readBody(r *http.Request) ([]byte, error) {
 // It returns a bool indicating whether a build was started.
 func buildIfDependent(deliveryID string, file string, commitID string,
 	builderChan chan string) bool {
-	if file == ".vimrc" || file == "Dockerfile" || file == "plugins.vim" {
+	if file == "Dockerfile" {
 		log.Printf("(Delivery ID: %v) Build triggered...\n"+
 			"File changed by git push: %v\n"+
 			"Commit ID to build from: %v\n"+
