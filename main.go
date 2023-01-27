@@ -27,7 +27,7 @@ func main() {
 	builderChan := make(chan string)
 	go builder(builderChan, m)
 
-	http.HandleFunc("/handle-push-event/multi-life-dev", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/handle-push-event/go-editor", func(w http.ResponseWriter, r *http.Request) {
 		deliveryID := r.Header.Get("X-GitHub-Delivery")
 		if deliveryID == "" {
 			log.Println("Request is missing a delivery ID.")
@@ -146,14 +146,14 @@ func sendEmail(m *mailer, msg []byte) {
 }
 
 func newRqstProcFailureMsg(deliveryID string) []byte {
-	return []byte("Subject: multi-life-dev-builder: error processing request\r\n" +
+	return []byte("Subject: go-editor-builder: error processing request\r\n" +
 		"\r\n" +
 		"Delivery ID: " + deliveryID + "\r\n" +
 		"See " + serverLogFileName + " for details.\r\n")
 }
 
 func newBuildFailureMsg(commitID string) []byte {
-	return []byte("Subject: multi-life-dev-builder: build failure\r\n" +
+	return []byte("Subject: go-editor-builder: build failure\r\n" +
 		"\r\n" +
 		"Commit ID: " + commitID + "\r\n" +
 		"See " + builderLogFileName + " for details.\r\n")
@@ -205,7 +205,7 @@ func buildIfDependent(deliveryID string, file string, commitID string,
 	return false
 }
 
-// builder builds and pushes the multi-life-dev image in response to commit IDs
+// builder builds and pushes the go-editor image in response to commit IDs
 // sent on builderChan. It should be run in a separate goroutine. If a commit
 // ID comes in while a build is in progress, the build is canceled and a new
 // one is started.
@@ -230,12 +230,12 @@ func builder(builderChan chan string, m *mailer) {
 		logger.Printf("Starting build. Commit ID: %v\n", commitID)
 
 		cmd := exec.Command("docker", "build", "--no-cache", "-t",
-			"alexnicoll/multi-life-dev",
-			"https://github.com/alex-nicoll/multi-life-dev.git#"+commitID)
+			"alexnicoll/go-editor",
+			"https://github.com/alex-nicoll/go-editor.git#"+commitID)
 		if !run(cmd, builderChan, logFile, logger, &commitID, m) {
 			continue
 		}
-		cmd = exec.Command("docker", "push", "alexnicoll/multi-life-dev")
+		cmd = exec.Command("docker", "push", "alexnicoll/go-editor")
 		if !run(cmd, builderChan, logFile, logger, &commitID, m) {
 			continue
 		}

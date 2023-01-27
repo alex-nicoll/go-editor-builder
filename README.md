@@ -1,6 +1,6 @@
-# multi-life-dev-builder
+# go-editor-builder
 
-This repository implements a minimal build server for [multi-life-dev](https://github.com/alex-nicoll/multi-life-dev).
+This repository implements a minimal build server for [go-editor](https://github.com/alex-nicoll/go-editor).
 
 When a build dependency changes, the server is notified via a GitHub Webhook. The server then builds and pushes a new image to Docker Hub. If the build fails for some reason, the server sends an email notification to `alex.nicoll@outlook.com`.
 
